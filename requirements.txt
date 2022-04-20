@@ -1,4 +1,6 @@
 pycocotools
+torchmetrics
 tqdm
 cython
 scipy
+wandb

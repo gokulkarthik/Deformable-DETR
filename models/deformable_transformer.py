@@ -53,6 +53,18 @@ class DeformableTransformer(nn.Module):
         else:
             self.reference_points = nn.Linear(d_model, 2)
 
+        ### ssl
+        self.ssl_pre_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU()
+        )
+        self.ssl_head = nn.ConvTranspose2d(
+            self.d_model, 
+            3, 
+            kernel_size=(8, 8), 
+            stride=(8, 8)
+        )
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -135,22 +147,31 @@ class DeformableTransformer(nn.Module):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
-            src = src.flatten(2).transpose(1, 2)
-            mask = mask.flatten(1)
-            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            src = src.flatten(2).transpose(1, 2) # [bs, c, h, w] -> [bs, c, hw] -> [bs, hw, c] # c,h,w wrt features
+            mask = mask.flatten(1) # [bs, h, w] -> [bs, hw]
+            pos_embed = pos_embed.flatten(2).transpose(1, 2) # [bs, c, h, w] -> [bs, c, hw] -> [bs, hw, c]
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
-        src_flatten = torch.cat(src_flatten, 1)
-        mask_flatten = torch.cat(mask_flatten, 1)
-        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
-        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
-        level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
-        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+        src_flatten = torch.cat(src_flatten, 1) # [lvl*bs, hw, c]
+        mask_flatten = torch.cat(mask_flatten, 1) # [lvl*bs, hw]
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # [lvl*bs, hw, c]
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device) # [lvl, 2]
+        level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1])) # [lvl]
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1) # [4, 4, 2]
+
 
         # encoder
-        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten) # [bs, num_tokens, c]
+
+        ### ssl
+        bs, _, _ = memory.shape
+        level = 0
+        ssl_encoder_out = memory[:, 0:level_start_index[level+1], :].reshape(bs, spatial_shapes[level][0], spatial_shapes[level][1], self.d_model) # [bs, h, w, d_model] # h=num_patch_rows; w=num_patch_cols
+        ssl_encoder_out = self.ssl_pre_head(ssl_encoder_out) # [bs, h, w, d_model]
+        ssl_encoder_out = ssl_encoder_out.permute(0, 3, 1, 2) # [bs, d_model, h, w] 
+        ssl_out = self.ssl_head(ssl_encoder_out) # [bs, 3, H, W] 
 
         # prepare input for decoder
         bs, _, c = memory.shape
@@ -182,8 +203,8 @@ class DeformableTransformer(nn.Module):
 
         inter_references_out = inter_references
         if self.two_stage:
-            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-        return hs, init_reference_out, inter_references_out, None, None
+            return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, ssl_out
+        return hs, init_reference_out, inter_references_out, None, None, ssl_out
 
 
 class DeformableTransformerEncoderLayer(nn.Module):

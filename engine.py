@@ -14,9 +14,11 @@ import math
 import os
 import sys
 from typing import Iterable
+import json
 
 import torch
 import util.misc as utils
+import wandb
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
@@ -24,22 +26,22 @@ from datasets.data_prefetcher import data_prefetcher
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, ssl_loss_weight=1):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+    header = '\nEpoch: [{}]'.format(epoch)
+    print_freq = 100
 
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
-        outputs = model(samples)
+        outputs, ssl_loss = model(samples)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -59,6 +61,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             print(loss_dict_reduced)
             sys.exit(1)
 
+        ##### ssl
+        losses = losses + ssl_loss_weight * ssl_loss
+        ####
+
         optimizer.zero_grad()
         losses.backward()
         if max_norm > 0:
@@ -75,7 +81,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples, targets = prefetcher.next()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    print("\nAveraged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -86,10 +92,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    header = 'Test:'
+    header = '\nTest:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    coco_evaluator = None
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     panoptic_evaluator = None
@@ -100,11 +107,17 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
+    result_file = os.path.join(output_dir, 'result.json')
+    if os.path.exists(result_file):
+        os.remove(result_file)
+
+    cnt = 0
+    json_list = []
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        outputs, _ = model(samples)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -125,6 +138,23 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        
+        cnt += 1
+        # if cnt == 10:
+        #     break
+        for image_id, result in res.items():
+            for i in range(100):
+                if result['scores'][i] >= 0.5:
+                    json_string = {
+                        "image_id": image_id, 
+                        "category_id": result['labels'][i].detach().cpu().numpy().tolist(), 
+                        "bbox": result['boxes'][i].detach().cpu().numpy().tolist(), 
+                        "score": result['scores'][i].detach().cpu().numpy().tolist(),
+                    } 
+                    #json.dump(json_string, file)
+                    json_list.append(json_string)
+
+        
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
@@ -137,6 +167,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 res_pano[i]["file_name"] = file_name
 
             panoptic_evaluator.update(res_pano)
+
+    with open(result_file, 'a') as file:
+        json.dump(json_list, file)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -163,4 +196,23 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
+
+    #log_coco_results_wandb(stats['coco_eval_bbox'])
+
     return stats, coco_evaluator
+
+def log_coco_results_wandb(results):
+    wandb.log({
+        "result/all_ap_50_95": results[0],
+        "result/all_ap_50": results[1],
+        "result/all_ap_75": results[2],
+        "result/small_ap_50_95": results[3], 
+        "result/medium_ap_50_95": results[4],
+        "result/large_ap_50_95": results[5],
+        "result/all_ar_50_95_1d": results[6],
+        "result/all_ar_50_95_10d": results[7],
+        "result/all_ar_75_95": results[8],
+        "result/small_ar_50_95": results[9],
+        "result/medium_ar_50_95": results[10],
+        "result/large_ar_50_95": results[11],
+    })

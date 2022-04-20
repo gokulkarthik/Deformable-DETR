@@ -13,6 +13,7 @@ Deformable DETR model and criterion classes.
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.transforms import Resize
 import math
 
 from util import box_ops
@@ -111,6 +112,9 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
+        ### ssl
+        self.ssl_criterion = nn.L1Loss()
+
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -137,6 +141,7 @@ class DeformableDETR(nn.Module):
             srcs.append(self.input_proj[l](src))
             masks.append(mask)
             assert mask is not None
+
         if self.num_feature_levels > len(srcs):
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
@@ -154,7 +159,11 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, ssl_out = self.transformer(srcs, masks, pos, query_embeds)
+
+        ### ssl
+        ssl_out = Resize(samples.tensors.shape[2:])(ssl_out)
+        ssl_loss = self.ssl_criterion(ssl_out, samples.tensors)
 
         outputs_classes = []
         outputs_coords = []
@@ -184,7 +193,7 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
-        return out
+        return out, ssl_loss
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -442,9 +451,11 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 20 if args.dataset_file != 'coco' else 91
+    num_classes = 16 if args.dataset_file != 'coco' else 91
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
+    # if args.dataset_file == "isaid":
+    #     num_classes = 15
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
@@ -462,6 +473,11 @@ def build(args):
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
+    if args.pretrained:
+        pretrained_weights = {k:v for k, v in torch.load(args.pretrained)['model'].items() if not k.startswith("class_embed")}
+        model.load_state_dict(pretrained_weights, strict=False)
+        #pass
+
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef

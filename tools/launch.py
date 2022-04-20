@@ -111,6 +111,7 @@ import socket
 from argparse import ArgumentParser, REMAINDER
 
 import torch
+import wandb
 
 
 def parse_args():

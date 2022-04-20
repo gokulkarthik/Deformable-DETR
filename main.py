@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 import datasets
 import util.misc as utils
 import datasets.samplers as samplers
+import wandb
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
@@ -33,9 +34,9 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--epochs', default=10, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
@@ -51,6 +52,8 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
+    parser.add_argument('--pretrained', type=str, default='ckpts/r50_deformable_detr-checkpoint.pth', 
+                        help="Path to the pretrained model")
 
     # * Backbone
     parser.add_argument('--backbone', default='resnet50', type=str,
@@ -105,8 +108,11 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
+    # ssl
+    parser.add_argument('--ssl_loss_weight', default=1, type=float)
+
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--dataset_file', default='isaid')
     parser.add_argument('--coco_path', default='./data/coco', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
@@ -150,7 +156,7 @@ def main(args):
     print('number of params:', n_parameters)
 
     dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
+    dataset_val = build_dataset(image_set='test', args=args)
 
     if args.distributed:
         if args.cache_mode:
@@ -268,12 +274,16 @@ def main(args):
         return
 
     print("Start training")
+    # if args.rank == 0:
+    #     wandb.init(project="deformable-detr")
+    #     wandb.config.update(args)
     start_time = time.time()
+    max_ap = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args.ssl_loss_weight)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -292,6 +302,18 @@ def main(args):
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
         )
+
+        if test_stats['coco_eval_bbox'][0] >= max_ap:
+            max_ap = test_stats['coco_eval_bbox'][0]
+            checkpoint_path = output_dir / 'checkpoint_best.pth'
+            utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                }, checkpoint_path)
+
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
