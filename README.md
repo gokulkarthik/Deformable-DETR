@@ -4,7 +4,7 @@ Self-supervised learning (SSL) methods such as masked language modeling have sho
 
 **Authors:** Gokul Karthik Kumar, Sahal Shaji Mullappilly, Abhishek Singh Gehlot
 
-## Work Adapted from Deformable DETR
+## Work Adapted from Deformable DETR:
 
 By [Xizhou Zhu](https://scholar.google.com/citations?user=02RXI00AAAAJ),  [Weijie Su](https://www.weijiesu.com/),  [Lewei Lu](https://www.linkedin.com/in/lewei-lu-94015977/), [Bin Li](http://staff.ustc.edu.cn/~binli/), [Xiaogang Wang](http://www.ee.cuhk.edu.hk/~xgwang/), [Jifeng Dai](https://jifengdai.org/).
 
